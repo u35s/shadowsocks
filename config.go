@@ -19,6 +19,7 @@ import (
 )
 
 type Config struct {
+	HttpProxy  string      `json:"http_proxy"`
 	Server     interface{} `json:"server"`
 	ServerPort int         `json:"server_port"`
 	LocalPort  int         `json:"local_port"`

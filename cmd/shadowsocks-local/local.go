@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"flag"
@@ -429,6 +430,93 @@ func main() {
 	}
 
 	parseServerConfig(config)
-
+	if config.HttpProxy != "" {
+		go httpProxy(config.HttpProxy)
+	}
 	run(cmdLocal + ":" + strconv.Itoa(config.LocalPort))
+}
+
+func httpProxy(addr string) {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	log.Printf("starting local http proxy server at %v ...\n", addr)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Printf("%v\n", err)
+			break
+		}
+		go handleHttpProxyConn(conn)
+	}
+}
+
+func readHttpHead(conn net.Conn, stop int) *bytes.Buffer {
+	cur := &bytes.Buffer{}
+	bts := make([]byte, 1)
+	var last byte
+	for {
+		_, err := conn.Read(bts)
+		if err != nil {
+			break
+		} else if bts[0] == '\r' {
+			continue
+		} else if bts[0] == '\n' {
+			if stop == 1 {
+				break
+			} else if last == '\n' && stop == 2 {
+				break
+			}
+		}
+		last = bts[0]
+		cur.Write(bts)
+	}
+	return cur
+}
+
+func handleHttpProxyConn(conn net.Conn) {
+	first := readHttpHead(conn, 1)
+	later := readHttpHead(conn, 2)
+	line := first.Bytes()
+	if n := len(line); n > 0 && line[n-1] == '\r' {
+		line = line[:n-1]
+	}
+	slc := strings.Split(string(line), " ")
+	if slc[0] != "CONNECT" || len(slc) < 2 {
+		return
+	}
+	addr := bytes.Buffer{}
+	addr.WriteByte(0x03)
+	hp := strings.Split(slc[1], ":")
+	if len(hp) != 2 {
+		log.Printf("connect host err,%v\n", slc[1])
+		return
+	}
+	addr.WriteByte(byte(uint8(len(hp[0]))))
+	addr.WriteString(hp[0])
+	port, err := strconv.ParseInt(hp[1], 10, 0)
+	if err != nil {
+		log.Printf("connect host port conv err,%v\n", hp[1])
+		return
+	}
+	//大端序
+	port16 := uint16(port)
+	addr.WriteByte(byte(uint8(port16 >> 8)))
+	addr.WriteByte(byte(uint8(port16 & 0x00ff)))
+	log.Printf("connect to %v:%v\n", hp[0], hp[1])
+	log.Printf("%v", first.String())
+	log.Printf("%v", later.String())
+	remote, err := createServerConn(addr.Bytes(), slc[1])
+	if err != nil {
+		log.Printf("%v\n", err)
+		if len(servers.srvCipher) > 1 {
+			log.Println("Failed connect to all avaiable shadowsocks server")
+		}
+		return
+	}
+	conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	go ss.PipeThenClose(conn, remote)
+	ss.PipeThenClose(remote, conn)
+	debug.Println("closed connection to", addr)
 }
