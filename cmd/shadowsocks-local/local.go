@@ -475,39 +475,70 @@ func readHttpHead(conn net.Conn, stop int) *bytes.Buffer {
 	return cur
 }
 
-func handleHttpProxyConn(conn net.Conn) {
-	first := readHttpHead(conn, 1)
-	later := readHttpHead(conn, 2)
-	line := first.Bytes()
+func getHostPortType(line []byte) (host, port, tp string, err error) {
 	if n := len(line); n > 0 && line[n-1] == '\r' {
 		line = line[:n-1]
 	}
 	slc := strings.Split(string(line), " ")
-	if slc[0] != "CONNECT" || len(slc) < 2 {
+	if len(slc) < 2 {
+		fmt.Errorf("first line err %v", string(line))
 		return
 	}
+	switch slc[0] {
+	case "CONNECT":
+		hp := strings.Split(slc[1], ":")
+		if len(hp) != 2 {
+			err = fmt.Errorf("connect extract host,port err %v", slc[1])
+			return
+		}
+		host, port, tp = hp[0], hp[1], "https"
+	default:
+		thp := strings.Split(slc[1], "/")
+		if len(thp) < 3 {
+			err = fmt.Errorf("%v host err %v", slc[0], slc[1])
+			return
+		}
+		hp := strings.Split(thp[2], ":")
+		if len(hp) == 1 {
+			host, port, tp = hp[0], "80", "http"
+		} else if len(hp) == 2 {
+			host, port, tp = hp[0], hp[1], "http"
+		} else {
+			err = fmt.Errorf("%v extract host,port err %v", slc[0], slc[1])
+			return
+		}
+	}
+	return
+}
+
+func handleHttpProxyConn(conn net.Conn) {
+	defer conn.Close()
+	first := readHttpHead(conn, 1)
+	later := readHttpHead(conn, 2)
+
+	hosts, ports, tps, err := getHostPortType(first.Bytes())
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
 	addr := bytes.Buffer{}
 	addr.WriteByte(0x03)
-	hp := strings.Split(slc[1], ":")
-	if len(hp) != 2 {
-		log.Printf("connect host err,%v\n", slc[1])
-		return
-	}
-	addr.WriteByte(byte(uint8(len(hp[0]))))
-	addr.WriteString(hp[0])
-	port, err := strconv.ParseInt(hp[1], 10, 0)
+	addr.WriteByte(byte(uint8(len(hosts))))
+	addr.WriteString(hosts)
+	port, err := strconv.ParseInt(ports, 10, 0)
 	if err != nil {
-		log.Printf("connect host port conv err,%v\n", hp[1])
+		log.Printf("connect host port conv err,%v\n", ports)
 		return
 	}
 	//大端序
 	port16 := uint16(port)
 	addr.WriteByte(byte(uint8(port16 >> 8)))
 	addr.WriteByte(byte(uint8(port16 & 0x00ff)))
-	log.Printf("connect to %v:%v\n", hp[0], hp[1])
+	log.Printf("connect to %v:%v\n", hosts, ports)
 	log.Printf("%v", first.String())
 	log.Printf("%v", later.String())
-	remote, err := createServerConn(addr.Bytes(), slc[1])
+	remote, err := createServerConn(addr.Bytes(), hosts+":"+ports)
 	if err != nil {
 		log.Printf("%v\n", err)
 		if len(servers.srvCipher) > 1 {
@@ -515,7 +546,14 @@ func handleHttpProxyConn(conn net.Conn) {
 		}
 		return
 	}
-	conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	if tps == "https" {
+		conn.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+	} else {
+		remote.Write(first.Bytes())
+		remote.Write([]byte{'\n'})
+		remote.Write(later.Bytes())
+		remote.Write([]byte{'\n'})
+	}
 	go ss.PipeThenClose(conn, remote)
 	ss.PipeThenClose(remote, conn)
 	debug.Println("closed connection to", addr)
